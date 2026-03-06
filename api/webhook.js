@@ -1,160 +1,207 @@
 // api/webhook.js
-// Serverless webhook handler for Telegram + Firestore registration flow.
-// Designed for Vercel serverless functions (node). Uses FIREBASE service account JSON stored in env var.
+// Webhook server for Telegram registration bot (Vercel serverless friendly).
+// ENV required: BOT_TOKEN, ADMIN_CHAT_IDS (comma list), SERVICE_ACCOUNT_JSON (stringified JSON)
 
-const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+const fetch = require('node-fetch');
 const admin = require('firebase-admin');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '').split(',').map(s => s.trim()).filter(Boolean); // e.g. "123,456"
-const SERVICE_ACCOUNT_JSON = process.env.SERVICE_ACCOUNT_JSON; // stringified JSON
-const BASE_TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const ADMIN_CHAT_IDS = (process.env.ADMIN_CHAT_IDS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+const SERVICE_ACCOUNT_JSON = process.env.SERVICE_ACCOUNT_JSON;
 
-// Initialize Firebase Admin only once (serverless friendly)
+if (!BOT_TOKEN) {
+  console.error('Missing BOT_TOKEN env var');
+}
+if (!SERVICE_ACCOUNT_JSON) {
+  console.error('Missing SERVICE_ACCOUNT_JSON env var');
+}
+
+const TELEGRAM_API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
+function tgApi(method, body) {
+  return fetch(`${TELEGRAM_API_BASE}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then((r) => r.json());
+}
+
+function tgSendMessage(chatId, text, opts = {}) {
+  const body = { chat_id: chatId, text, ...opts };
+  return tgApi('sendMessage', body);
+}
+function tgSendPhoto(chatId, photo, caption = '', opts = {}) {
+  const body = { chat_id: chatId, photo, caption, ...opts };
+  return tgApi('sendPhoto', body);
+}
+function tgAnswerCallback(queryId, opts = {}) {
+  return tgApi('answerCallbackQuery', { callback_query_id: queryId, ...opts });
+}
+function tgEditMessageCaption(chatId, messageId, caption, opts = {}) {
+  const body = { chat_id: chatId, message_id: messageId, caption, ...opts };
+  return tgApi('editMessageCaption', body);
+}
+
+// Initialize Firebase Admin (safe for serverless - init only once)
 function initFirebase() {
   if (admin.apps && admin.apps.length) return;
-  if (!SERVICE_ACCOUNT_JSON) {
-    console.error('SERVICE_ACCOUNT_JSON missing');
-    throw new Error('SERVICE_ACCOUNT_JSON missing');
-  }
   const sa = JSON.parse(SERVICE_ACCOUNT_JSON);
   admin.initializeApp({
     credential: admin.credential.cert(sa),
   });
 }
-let db;
 try {
   initFirebase();
-  db = admin.firestore();
-} catch (err) {
-  console.error('Firebase init error', err);
+} catch (e) {
+  console.error('Firebase init error', e);
+}
+const db = admin.firestore();
+
+// Utility: safe doc id from phone or fallback chatId
+function userDocIdFrom(phone, chatId) {
+  if (phone && String(phone).trim()) {
+    return String(phone).replace(/\s+/g, '');
+  }
+  return String(chatId);
 }
 
-// Helpers to call Telegram API
-async function tgSendMessage(chatId, text, opts = {}) {
-  const body = { chat_id: chatId, text, ...opts, parse_mode: opts.parse_mode || 'Markdown' };
-  const res = await fetch(`${BASE_TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
-async function tgSendPhoto(chatId, photoFileIdOrUrl, caption = '', opts = {}) {
-  const body = { chat_id: chatId, photo: photoFileIdOrUrl, caption, ...opts, parse_mode: opts.parse_mode || 'Markdown' };
-  const res = await fetch(`${BASE_TELEGRAM_API}/sendPhoto`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  return res.json();
-}
-async function tgAnswerCallback(cbQueryId, text) {
-  await fetch(`${BASE_TELEGRAM_API}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: cbQueryId, text }),
-  });
-}
+// Messages (bilingual prompts)
+const M = {
+  chooseLang: 'Please choose a language / እባክዎ ቋንቋ ይምረጡ።',
+  askName: { am: 'እባክዎ ሙሉ ስምዎን ያስገቡ።', en: 'Please enter your full name:' },
+  askPhone: { am: 'እባክዎ ስልክ ቁጥርዎን ያስገቡ።', en: 'Please enter your phone number:' },
+  askPass: { am: 'እባክዎ 4 የሚገባ የይለፍ ቃል ይፍጠሩ።', en: 'Please create a password (min 4 chars):' },
+  confirmPass: { am: 'እባክዎ የይለፍ ቃልዎን ያረጋግጡ።', en: 'Please confirm your password:' },
+  passShort: { am: 'የይለፍ ቃሉ አጭር ነው። 4 አሃዞች ይወስዱ።', en: 'Password too short; min 4 chars.' },
+  passMismatch: { am: 'የይለፍ ቃሉ አይመሳሰልም። እንደገና ይሞክሩ።', en: 'Passwords do not match. Try again.' },
+  paymentInstructionAm:
+    'እባክዎ 150 ብር ይክፈሉ።\nCBE: 1000651098347 (yunus)\nTelebirr: 0985711861 (yenus)\nከዚያም የክፍያ ስክሪንሾት ይላኩ።',
+  paymentInstructionEn:
+    'Please pay 150 ETB to:\nCBE: 1000651098347 (yunus)\nTelebirr: 0985711861 (yenus)\nThen upload the payment screenshot here.',
+  thanksWait: { am: 'መረጃዎት ተቀብሏል። 6-24 ሰዓታት ይጠብቁ።', en: 'Thanks! Your payment is submitted. Please wait 6-24 hours.' },
+  approved: { am: '🎉 መለያዎ ተፈትሏል። አሁን መግባት ይችላሉ።', en: '🎉 Your account is approved. You can now log in.' },
+  rejected: { am: '❌ ክፍያዎ አልተቀበለም። እባክዎ ያገለግሉ።', en: '❌ Your payment was rejected. Contact support.' }
+};
 
-// Simple registration state machine stored in Firestore
-// Collection: "registrations" documents keyed by chatId (string)
-async function startRegistration(chatId, from) {
-  await db.collection('registrations').doc(String(chatId)).set({
-    step: 'ASK_LANGUAGE',
-    telegramId: from.id,
-    telegramUsername: from.username || null,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-  const keyboard = {
+// Handle language keyboard
+function langKeyboard() {
+  return {
     reply_markup: {
       inline_keyboard: [
         [{ text: 'አማርኛ', callback_data: 'lang_am' }, { text: 'English', callback_data: 'lang_en' }]
       ]
     }
   };
-  await tgSendMessage(chatId,
-    '*Welcome / እንኳን ደህና መጡ!*\n\nPlease choose a language / ቋንቋ ይምረጡ።',
-    keyboard
-  );
 }
 
-async function handleLanguageChoice(chatId, lang) {
-  const docRef = db.collection('registrations').doc(String(chatId));
-  await docRef.update({ lang, step: 'ASK_NAME' });
-  const prompt = lang === 'am' ? 'እባክዎ ሙሉ ስምዎን ያስገቡ።' : 'Please enter your full name:';
-  await tgSendMessage(chatId, prompt);
+// Admin approve/reject keyboard
+function adminKeyboardFor(userPhoneOrId) {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '✅ Approve', callback_data: `approve_${userPhoneOrId}` },
+          { text: '❌ Reject', callback_data: `reject_${userPhoneOrId}` }
+        ]
+      ]
+    }
+  };
 }
 
-// --- main handler
-module.exports = async function handler(req, res) {
-  // Vercel uses GET for verification sometimes; we only accept POST updates
-  if (req.method !== 'POST') {
-    res.status(200).send('OK');
-    return;
-  }
-
-  const update = req.body;
+// MAIN exported handler for Vercel serverless (req/res)
+module.exports = async (req, res) => {
   try {
-    // Two main types: message/edited_message and callback_query
+    // Telegram will POST updates here
+    if (req.method !== 'POST') {
+      res.status(200).send('OK');
+      return;
+    }
+
+    const update = req.body;
+
+    // CALLBACK QUERY (inline button clicks)
     if (update.callback_query) {
       const cb = update.callback_query;
       const data = cb.data;
-      const chatId = cb.from.id;
+      const from = cb.from;
       const cbId = cb.id;
 
-      // language selection
+      // Language selection
       if (data === 'lang_am' || data === 'lang_en') {
         const lang = data === 'lang_am' ? 'am' : 'en';
-        await handleLanguageChoice(chatId, lang);
+        await db.collection('registrations').doc(String(from.id)).set(
+          {
+            step: 'ASK_NAME',
+            lang,
+            telegramId: from.id,
+            telegramUsername: from.username || null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+        // Ask name in chosen language
+        const ask = lang === 'am' ? M.askName.am : M.askName.en;
+        await tgSendMessage(from.id, ask);
         await tgAnswerCallback(cbId, lang === 'am' ? 'አማርኛ ተመርጧል' : 'English selected');
         res.status(200).send('ok');
         return;
       }
 
-      // admin approve/reject -> callback_data = approve_<phone> or reject_<phone>
-      if (data.startsWith('approve_') || data.startsWith('reject_')) {
-        // verify admin
-        const adminIdStr = String(cb.from.id);
-        if (!ADMIN_CHAT_IDS.includes(adminIdStr)) {
+      // Admin actions: approve_<phoneOrId> or reject_<phoneOrId>
+      if (data && (data.startsWith('approve_') || data.startsWith('reject_'))) {
+        const allowed = ADMIN_CHAT_IDS.includes(String(from.id));
+        if (!allowed) {
           await tgAnswerCallback(cbId, 'Not authorized');
           res.status(200).send('ok');
           return;
         }
-        const [action, userPhone] = data.split('_');
-        const userRef = db.collection('users').doc(String(userPhone));
-        const userDoc = await userRef.get();
-        if (!userDoc.exists) {
+        const [action, userKey] = data.split('_');
+        const userDocId = String(userKey);
+        // Update user doc in Firestore
+        const userRef = db.collection('users').doc(userDocId);
+        const userSnap = await userRef.get();
+        if (!userSnap.exists) {
           await tgAnswerCallback(cbId, 'User not found');
           res.status(200).send('ok');
           return;
         }
+        const userData = userSnap.data();
         if (action === 'approve') {
-          await userRef.update({ isPaid: true, approvedAt: admin.firestore.FieldValue.serverTimestamp() });
+          await userRef.update({
+            isPaid: true,
+            approvedBy: from.username || from.id,
+            approvedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
           // notify user
-          const userData = userDoc.data();
           if (userData && userData.telegramChatId) {
-            await tgSendMessage(userData.telegramChatId, '*Your registration has been approved!* 🎉\nYou can now login to the app.');
+            await tgSendMessage(userData.telegramChatId, M.approved[userData.lang || 'en'] || M.approved.en);
           }
-          // update admin caption (best-effort)
+          // annotate admin message
           try {
-            await fetch(`${BASE_TELEGRAM_API}/editMessageCaption`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: cb.message.chat.id,
-                message_id: cb.message.message_id,
-                caption: (cb.message.caption || '') + `\n\n✅ Approved by @${cb.from.username || cb.from.first_name}`
-              })
-            });
-          } catch(e) { console.warn('edit caption failed', e.message); }
+            const newCaption = (cb.message.caption || '') + `\n\n✅ Approved by ${from.username || from.first_name}`;
+            await tgEditMessageCaption(cb.message.chat.id, cb.message.message_id, newCaption);
+          } catch (e) {
+            console.warn('Failed to edit admin message caption', e && e.message);
+          }
           await tgAnswerCallback(cbId, 'User approved');
         } else {
           // reject
-          await userRef.update({ isPaid: false, rejectedAt: admin.firestore.FieldValue.serverTimestamp() });
-          const userData = userDoc.data();
+          await userRef.update({
+            isPaid: false,
+            rejectedBy: from.username || from.id,
+            rejectedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
           if (userData && userData.telegramChatId) {
-            await tgSendMessage(userData.telegramChatId, '*Payment rejected.* Please contact support.');
+            await tgSendMessage(userData.telegramChatId, M.rejected[userData.lang || 'en'] || M.rejected.en);
+          }
+          try {
+            const newCaption = (cb.message.caption || '') + `\n\n❌ Rejected by ${from.username || from.first_name}`;
+            await tgEditMessageCaption(cb.message.chat.id, cb.message.message_id, newCaption);
+          } catch (e) {
+            console.warn('Failed to edit admin message caption', e && e.message);
           }
           await tgAnswerCallback(cbId, 'User rejected');
         }
@@ -162,155 +209,170 @@ module.exports = async function handler(req, res) {
         return;
       }
 
-      // unknown callback
+      // default
       await tgAnswerCallback(cbId, 'Unknown action');
       res.status(200).send('ok');
       return;
     }
 
+    // MESSAGE updates
     if (update.message) {
       const msg = update.message;
       const chatId = msg.chat.id;
+      const from = msg.from || {};
       const text = msg.text || null;
 
-      // fetch existing registration (if any)
+      // Fetch registration in-progress if exists
       const regRef = db.collection('registrations').doc(String(chatId));
       const regSnap = await regRef.get();
       const reg = regSnap.exists ? regSnap.data() : null;
 
-      // If /start and no registration => start flow
+      // If /start command — initialize and ask language
       if (text && text.startsWith('/start')) {
-        await startRegistration(chatId, msg.from);
-        res.status(200).send('ok');
-        return;
-      }
-
-      // If there is a reg in progress:
-      if (reg && reg.step) {
-        const step = reg.step;
-        const lang = reg.lang || 'en';
-        const t = (am, en) => (lang === 'am' ? am : en);
-
-        if (step === 'ASK_NAME') {
-          await regRef.update({ name: msg.text || '', step: 'ASK_PHONE' });
-          await tgSendMessage(chatId, t('እባክዎ ስልክ ቁጥርዎን ያስገቡ።', 'Please enter your phone number:'));
-          res.status(200).send('ok');
-          return;
-        }
-
-        if (step === 'ASK_PHONE') {
-          const phone = msg.text || '';
-          await regRef.update({ phone, step: 'ASK_PASSWORD' });
-          await tgSendMessage(chatId, t('እባክዎ የይለፍ ቃል ይፍጠሩ (ቢያንስ 4 አሃዞች):', 'Please create a password (min 4 chars):'));
-          res.status(200).send('ok');
-          return;
-        }
-
-        if (step === 'ASK_PASSWORD') {
-          const pass = msg.text || '';
-          if ((pass || '').length < 4) {
-            await tgSendMessage(chatId, t('የይለፍ ቃሉ ሀሳብ አትደርስ። እባክዎ 4 የሚገባ አቁጥር ያስገቡ።', 'Password too short, please send at least 4 chars'));
-            res.status(200).send('ok');
-            return;
-          }
-          await regRef.update({ tempPassword: pass, step: 'CONFIRM_PASSWORD' });
-          await tgSendMessage(chatId, t('እባክዎ የይለፍ ቃልዎን ያረጋግጡ።', 'Please confirm your password:'));
-          res.status(200).send('ok');
-          return;
-        }
-
-        if (step === 'CONFIRM_PASSWORD') {
-          const pass = msg.text || '';
-          if (pass !== reg.tempPassword) {
-            await tgSendMessage(chatId, t('የይለፍ ቃሉ አይመሳሰልም። እንደገና ይሞክሩ።', 'Passwords do not match. Try again.'));
-            res.status(200).send('ok');
-            return;
-          }
-          // move to ask payment
-          await regRef.update({
-            password: pass,
-            tempPassword: admin.firestore.FieldValue.delete(),
-            step: 'ASK_PAYMENT'
-          });
-          const paymentMsg = t(
-            `እባክዎ የክፍያውን 150 ብር ይክፈሉ።\nCBE: 1000651098347 (yunus)\nTelebirr: 0985711861 (yenus)\nከዚያም የክፍያ ስክሪንሾት ይላኩ።`,
-            `Please pay 150 ETB to:\nCBE: 1000651098347 (yunus)\nTelebirr: 0985711861 (yenus)\nThen upload the payment screenshot here.`
-          );
-          await tgSendMessage(chatId, paymentMsg);
-          res.status(200).send('ok');
-          return;
-        }
-
-        if (step === 'ASK_PAYMENT') {
-          // If user sent photo it will be handled below (message.photo)
-          // otherwise just remind them
-          await tgSendMessage(chatId, t('እባክዎ የክፍያ ስክሪንሾት ይላኩ።', 'Please upload payment screenshot/receipt.'));
-          res.status(200).send('ok');
-          return;
-        }
-      }
-
-      // If message contains photo (and we have reg in ASK_PAYMENT)
-      if (msg.photo && reg && reg.step === 'ASK_PAYMENT') {
-        const photo = msg.photo[msg.photo.length - 1]; // highest res
-        const fileId = photo.file_id;
-
-        // Save user (users collection) with isPaid=false
-        const usersRef = db.collection('users').doc(String(reg.phone || String(chatId)));
-        await usersRef.set({
-          telegramChatId: chatId,
-          telegramId: reg.telegramId || msg.from.id,
-          telegramUsername: reg.telegramUsername || msg.from.username || null,
-          name: reg.name || null,
-          phone: reg.phone || null,
-          password: reg.password || null, // consider hashing in production
-          isPaid: false,
-          paymentPhotoFileId: fileId,
-          registeredAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        // Notify user
-        await tgSendMessage(chatId, (reg.lang === 'am') ? 'መረጃዎት ተቀብሏል። እባክዎ 6-24 ሰዓታት ይጠብቁ።' : 'Thanks! Your payment has been sent for review. Please wait 6-24 hours.');
-
-        // Notify admins with photo + approve/reject buttons
-        const caption = `🔔 New registration\nName: ${reg.name || '-'}\nPhone: ${reg.phone || '-'}\nTG: @${msg.from.username || ''}\nChatId: ${chatId}`;
-        const keyboard = {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ Approve', callback_data: `approve_${reg.phone || chatId}` },
-                { text: '❌ Reject', callback_data: `reject_${reg.phone || chatId}` }
-              ]
-            ]
+        // create registration entry or merge
+        await regRef.set(
+          {
+            step: 'ASK_LANGUAGE',
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            telegramId: from.id,
+            telegramUsername: from.username || null
           },
-          parse_mode: 'Markdown'
-        };
+          { merge: true }
+        );
+        await tgSendMessage(chatId, M.chooseLang, langKeyboard());
+        res.status(200).send('ok');
+        return;
+      }
+
+      // If no registration entry but user sends text, prompt /start
+      if (!reg) {
+        // do nothing OR invite to /start
+        // we won't spam; just return ok
+        res.status(200).send('ok');
+        return;
+      }
+
+      // If registration in progress
+      const step = reg.step || 'ASK_LANGUAGE';
+      const lang = reg.lang || 'en';
+      const t = (obj) => (typeof obj === 'string' ? obj : obj[lang] || obj.en);
+
+      // Steps: ASK_NAME -> ASK_PHONE -> ASK_PASSWORD -> CONFIRM_PASSWORD -> ASK_PAYMENT -> WAITING_PAYMENT
+      if (step === 'ASK_NAME' && text) {
+        await regRef.update({ name: text, step: 'ASK_PHONE' });
+        await tgSendMessage(chatId, t(M.askPhone));
+        res.status(200).send('ok');
+        return;
+      }
+
+      if (step === 'ASK_PHONE' && text) {
+        const phone = text.trim();
+        await regRef.update({ phone, step: 'ASK_PASSWORD' });
+        await tgSendMessage(chatId, t(M.askPass));
+        res.status(200).send('ok');
+        return;
+      }
+
+      if (step === 'ASK_PASSWORD' && text) {
+        if (text.length < 4) {
+          await tgSendMessage(chatId, t(M.passShort));
+          res.status(200).send('ok');
+          return;
+        }
+        await regRef.update({ tempPassword: text, step: 'CONFIRM_PASSWORD' });
+        await tgSendMessage(chatId, t(M.confirmPass));
+        res.status(200).send('ok');
+        return;
+      }
+
+      if (step === 'CONFIRM_PASSWORD' && text) {
+        if (!reg.tempPassword || text !== reg.tempPassword) {
+          await tgSendMessage(chatId, t(M.passMismatch));
+          res.status(200).send('ok');
+          return;
+        }
+        // Save final password (NOTE: production: hash passwords!)
+        await regRef.update({
+          password: reg.tempPassword,
+          tempPassword: admin.firestore.FieldValue.delete(),
+          step: 'ASK_PAYMENT'
+        });
+        // Send payment instructions
+        const payMsg = reg.lang === 'am' ? M.paymentInstructionAm : M.paymentInstructionEn;
+        await tgSendMessage(chatId, payMsg);
+        res.status(200).send('ok');
+        return;
+      }
+
+      // If user sends a photo while in ASK_PAYMENT
+      if (msg.photo && reg && reg.step === 'ASK_PAYMENT') {
+        // highest res photo
+        const photo = msg.photo[msg.photo.length - 1];
+        const fileId = photo.file_id;
+        // save user doc keyed by phone if provided else chatId
+        const phoneKey = reg.phone ? String(reg.phone).replace(/\s+/g, '') : String(chatId);
+        const userRef = db.collection('users').doc(phoneKey);
+        await userRef.set(
+          {
+            telegramChatId: chatId,
+            telegramId: from.id,
+            telegramUsername: from.username || null,
+            name: reg.name || null,
+            phone: reg.phone || null,
+            password: reg.password || null, // in prod: store hashed password instead
+            lang: reg.lang || 'en',
+            isPaid: false,
+            paymentPhotoFileId: fileId,
+            registeredAt: admin.firestore.FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+
+        // notify user
+        await tgSendMessage(chatId, t(M.thanksWait));
+
+        // notify admins with photo and approve/reject buttons
+        const caption = `🔔 New registration\nName: ${reg.name || '-'}\nPhone: ${reg.phone || '-'}\nTG: @${from.username || ''}\nChatId: ${chatId}`;
         // send photo to each admin
-        for (const aid of ADMIN_CHAT_IDS) {
+        for (const adminId of ADMIN_CHAT_IDS) {
           try {
-            await tgSendPhoto(aid, fileId, caption, keyboard);
+            await tgSendPhoto(adminId, fileId, caption, adminKeyboardFor(phoneKey));
           } catch (e) {
-            console.error('sendPhoto to admin failed', aid, e.message);
+            console.warn('Failed to send photo to admin', adminId, e && e.message);
           }
         }
 
-        // finalize reg doc => move to WAITING_PAYMENT
-        await db.collection('registrations').doc(String(chatId)).update({ step: 'WAITING_PAYMENT', paymentPhotoFileId: fileId });
+        // update registration status
+        await regRef.update({ step: 'WAITING_PAYMENT', paymentPhotoFileId: fileId });
 
         res.status(200).send('ok');
         return;
       }
 
-      // default reply for unknown messages
-      // optional: prompt them to /start
+      // If user sends photo but not in payment step - gentle reminder
+      if (msg.photo) {
+        await tgSendMessage(chatId, reg.lang === 'am' ? 'እባክዎ በክፍያ ሂደት መላእክት ላይ ይላኩ።' : 'Please follow the registration flow and upload payment photo when requested.');
+        res.status(200).send('ok');
+        return;
+      }
+
+      // For ASK_PAYMENT step if user sends text - remind
+      if (step === 'ASK_PAYMENT' && text) {
+        await tgSendMessage(chatId, reg.lang === 'am' ? 'እባክዎ የክፍያ ስክሪንሾት ይላኩ።' : 'Please upload payment screenshot/receipt.');
+        res.status(200).send('ok');
+        return;
+      }
+
+      // fallback
       res.status(200).send('ok');
       return;
     }
 
-    // otherwise
+    // nothing else to do
     res.status(200).send('ok');
   } catch (err) {
-    console.error('Handler error', err);
+    console.error('Webhook handler error:', err && (err.stack || err.message || err));
+    // Always respond 200 to Telegram to avoid retries on non-critical errors
     res.status(200).send('ok');
   }
 };
