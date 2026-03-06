@@ -1,0 +1,11 @@
+{
+  "name": "bible-telegram-bot",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node api/webhook.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^11.0.0",
+    "node-fetch": "^2.6.7"
+  }
+}
