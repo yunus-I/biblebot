@@ -1,0 +1,20 @@
+name: Deploy to JustRunMy.App
+
+on:
+  push:
+    branches: [ main ] # or master, depending on your branch name
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Registry
+        run: echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login jdr-d72rk59n.justrunmy.app -u ${{ secrets.REGISTRY_USERNAME }} --password-stdin
+
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t jdr-d72rk59n.justrunmy.app/d72rk59n:v2 .
+          docker push jdr-d72rk59n.justrunmy.app/d72rk59n:v2
